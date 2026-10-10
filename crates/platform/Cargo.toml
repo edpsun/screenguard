@@ -1,0 +1,31 @@
+[package]
+name = "platform"
+version = "0.1.0"
+edition = "2024"
+
+# Everything the agent needs from the host OS lives behind this crate: session
+# monitoring, screen locking, desktop notifications, local user enumeration,
+# host identity, log retrieval and web filtering. Exactly one backend compiles
+# per target (`src/linux`, `src/macos`), so the agent itself carries no cfg.
+#
+# Deliberately free of C-linking dependencies, so the macOS backend can be
+# type-checked from a Linux host with
+#   cargo check -p platform --target aarch64-apple-darwin
+
+[dependencies]
+common = { path = "../common" }
+tokio = { version = "1", features = ["rt", "macros", "time", "process", "net", "io-util", "sync"] }
+anyhow = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# session/lock/notify over logind + the tray status interface
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# systemd readiness/watchdog notifications
+libsystemd = "0.7"
+futures-util = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# parses `ioreg -a` output (XML plist): console sessions, lock state, idle time
+plist = "1"

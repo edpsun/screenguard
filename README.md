@@ -75,7 +75,7 @@ That is all of it. No window titles, no process or application names, no keystro
 | `notify_user` | show a desktop notification |
 | `pairing_accepted` | finish pairing, store the auth token |
 | `unpair` | forget the pairing and restart |
-| `fetch_logs` | return the last 50 lines of `journalctl -u screenguard-agent` |
+| `fetch_logs` | return the last 50 lines of `journalctl -u screenguard-agent` (on macOS, of `/var/log/screenguard-agent.log`) |
 | `update_agent` | run the published installer as root (see below) |
 
 There is no message that runs an arbitrary command, reads a file, or opens a shell. `update_agent` is the one privileged operation: it launches `install.sh --update` from the GitHub releases page as root via `systemd-run`, and writes a loud banner to the journal when it does. There is currently no config switch to turn it off — if that is not acceptable for a machine, self-host, or pin the agent by other means.
@@ -107,6 +107,8 @@ The server and agent can run on the same machine or on separate machines. The ag
 - Managed machines: a graphical session manager that supports `loginctl terminate-session` (GNOME, KDE, etc.)
 - Server machine: any Linux with systemd; does not need a graphical desktop
 
+Managed machines can also run **macOS** — see [macOS agent](#macos-agent). The server is Linux-only.
+
 ## Install
 
 ```bash
@@ -130,6 +132,50 @@ curl -fsSL https://github.com/adambie/screenguard/releases/latest/download/insta
 ```
 
 You will be asked separately whether to remove the config directory and the database.
+
+## macOS agent
+
+> **New and not yet tested on hardware by the maintainer.** The protocol is identical, so a macOS machine appears in the web UI and the mobile app like any other device. Design notes and the open verification list are in [docs/0003-macos-agent.md](docs/0003-macos-agent.md).
+
+Requires macOS 14 or newer, Apple silicon or Intel. The agent runs as a root LaunchDaemon and manages Standard (non-admin) accounts.
+
+```bash
+# self-hosted server
+sudo ./install-macos.sh --server-url ws://192.168.1.100:8765/ws
+
+# or the hosted server
+sudo ./install-macos.sh --cloud-account you@example.com
+```
+
+There is no mDNS discovery on macOS: the agent has to be told where its server is, with `--server-url` or `--cloud-account` (or `server_url` / `cloud_account` in `/etc/screenguard/agent.toml`).
+
+To build it yourself on the Mac — needs the Xcode command line tools (`xcode-select --install`):
+
+```bash
+cargo build --release -p agent
+
+# check what the agent can see on this machine — needs neither root nor a
+# server, and exits non-zero if anything it depends on is unreadable
+./target/release/agent --probe
+
+sudo ./install-macos.sh --from target/release/agent --server-url ws://192.168.1.100:8765/ws
+```
+
+Then: `tail -f /var/log/screenguard-agent.log`, restart with `sudo launchctl kickstart -k system/org.screenguard.agent`, remove with `sudo ./install-macos.sh --uninstall`.
+
+**Differences from the Linux agent**
+
+| | Linux | macOS |
+|---|---|---|
+| Lock | locks the session; unlocks again when time is granted | locks by switching to the login window; **cannot** unlock — the user logs back in |
+| Session preservation | supported | supported (apps keep running behind the login window) |
+| Logout after grace period | supported | supported |
+| Desktop notifications | native | via AppleScript, so macOS attributes them to *Script Editor*; nothing appears if the user denied that app notification permission |
+| Web content filtering | nftables + per-user DNS proxy | **not available** — the server hides the feature for the device |
+| Server auto-discovery | mDNS | not available |
+| Remote update from the web UI | supported | not supported; re-run `install-macos.sh` |
+
+Enforcement relies on the managed account being a **Standard** user: an administrator can unload the LaunchDaemon. The installer warns you if the logged-in account is an admin.
 
 ## Running the server in Docker
 

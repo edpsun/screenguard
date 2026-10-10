@@ -1,35 +1,39 @@
+//! Linux backend: logind over D-Bus for sessions and locking, the freedesktop
+//! notification spec for messages, nftables + a per-UID DNS proxy for web
+//! filtering.
+
+mod dns_proxy;
+mod nftables;
+pub mod status_ipc;
+pub mod web_filter;
+
+use crate::session::{SessionEvent, SessionUsageState};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use zbus::{Connection, proxy};
 
-#[derive(Debug, Clone)]
-pub enum SessionEvent {
-    StartupSnapshot { sessions: Vec<(u32, String)> },
-    SessionStarted { uid: u32, session_id: String },
-    SessionEnded { uid: u32, session_id: String },
-    StateChanged { uid: u32, session_id: String, state: SessionUsageState },
-    PrepareForSleep { suspend: bool },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SessionUsageState {
-    pub active: Option<bool>,
-    pub locked: Option<bool>,
-    pub idle: Option<bool>,
-}
-
-pub(crate) fn session_counts_usage(state: &SessionUsageState) -> bool {
-    state.active == Some(true)
-        && state.locked == Some(false)
-        && state.idle == Some(false)
-}
-
-pub(crate) fn uid_counts_usage<'a>(
-    states: impl IntoIterator<Item = &'a SessionUsageState>,
-) -> bool {
-    states.into_iter().any(session_counts_usage)
+/// Internal per-user helper modes.
+///
+/// Both notifications and the Cinnamon screensaver can only be driven from a
+/// connection whose peer credentials are the target user's, so the agent
+/// re-executes itself under that uid with the session bus in the environment.
+/// Returns `Some(exit_code)` when this process was such a re-execution and must
+/// exit instead of starting the agent.
+pub async fn run_helper_mode(args: &[String]) -> Option<i32> {
+    match args.get(1).map(String::as_str) {
+        Some("--lock-cinnamon") => Some(lock_cinnamon_as_current_user().await),
+        Some("--notify") => {
+            let summary = args.get(2).map(String::as_str).unwrap_or("");
+            let body = args.get(3).map(String::as_str).unwrap_or("");
+            if let Err(e) = notify_as_current_user(summary, body).await {
+                tracing::warn!("Notification failed: {e}");
+            }
+            Some(0)
+        }
+        _ => None,
+    }
 }
 
 #[proxy(
@@ -94,12 +98,12 @@ trait CinnamonScreenSaver {
     fn get_active(&self) -> zbus::Result<bool>;
 }
 
-pub struct DbusMonitor {
+pub struct SessionMonitor {
     conn: Connection,
     tx: mpsc::Sender<SessionEvent>,
 }
 
-impl DbusMonitor {
+impl SessionMonitor {
     pub async fn new(tx: mpsc::Sender<SessionEvent>) -> Result<Self> {
         let conn = Connection::system().await?;
         Ok(Self { conn, tx })
@@ -385,7 +389,7 @@ async fn try_cinnamon_lock(uid: u32) -> bool {
 /// Called when the agent binary is invoked with `--lock-cinnamon` as the target user.
 /// Connects to the user session bus, requests Cinnamon lock, and verifies it activated.
 /// Exit 0 = locked and confirmed; exit 1 = unavailable or unconfirmed.
-pub async fn lock_cinnamon_as_current_user() -> i32 {
+async fn lock_cinnamon_as_current_user() -> i32 {
     let conn = match Connection::session().await {
         Ok(c) => c,
         Err(e) => {
@@ -499,7 +503,7 @@ pub async fn send_desktop_notification(uid: u32, summary: &str, body: &str) -> R
 /// Called when the agent binary is invoked with `--notify`.
 /// At this point the process is already running as the target user, so the session
 /// bus connection uses the correct peer credentials.
-pub async fn notify_as_current_user(summary: &str, body: &str) -> Result<()> {
+async fn notify_as_current_user(summary: &str, body: &str) -> Result<()> {
     let conn = zbus::Connection::session().await?;
     let proxy = NotificationsProxy::new(&conn).await?;
     let hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
@@ -546,73 +550,7 @@ trait Notifications {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cinnamon, session_counts_usage, uid_counts_usage, SessionUsageState};
-
-    fn state(active: bool, locked: bool, idle: bool) -> SessionUsageState {
-        SessionUsageState {
-            active: Some(active),
-            locked: Some(locked),
-            idle: Some(idle),
-        }
-    }
-
-    #[test]
-    fn active_unlocked_non_idle_session_counts() {
-        assert!(session_counts_usage(&state(true, false, false)));
-    }
-
-    #[test]
-    fn active_locked_non_idle_session_does_not_count() {
-        assert!(!session_counts_usage(&state(true, true, false)));
-    }
-
-    #[test]
-    fn inactive_unlocked_non_idle_session_does_not_count() {
-        assert!(!session_counts_usage(&state(false, false, false)));
-    }
-
-    #[test]
-    fn active_unlocked_idle_session_does_not_count() {
-        assert!(!session_counts_usage(&state(true, false, true)));
-    }
-
-    #[test]
-    fn inactive_locked_non_idle_session_does_not_count() {
-        assert!(!session_counts_usage(&state(false, true, false)));
-    }
-
-    #[test]
-    fn locked_idle_session_does_not_count() {
-        assert!(!session_counts_usage(&state(true, true, true)));
-    }
-
-    #[test]
-    fn one_qualifying_session_makes_uid_count() {
-        let states = [state(false, false, false), state(true, false, false)];
-        assert!(uid_counts_usage(&states));
-    }
-
-    #[test]
-    fn no_qualifying_sessions_make_uid_not_count() {
-        let states = [state(true, true, false), state(false, false, false)];
-        assert!(!uid_counts_usage(&states));
-    }
-
-    #[test]
-    fn multiple_qualifying_sessions_still_make_one_uid_count() {
-        let states = [state(true, false, false), state(true, false, false)];
-        assert!(uid_counts_usage(&states));
-    }
-
-    #[test]
-    fn unknown_property_fails_closed() {
-        let states = [SessionUsageState {
-            active: Some(true),
-            locked: None,
-            idle: Some(false),
-        }];
-        assert!(!uid_counts_usage(&states));
-    }
+    use super::is_cinnamon;
 
     #[test]
     fn is_cinnamon_recognises_cinnamon_desktops() {

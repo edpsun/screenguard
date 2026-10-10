@@ -1,9 +1,15 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
-use crate::{dns_proxy, nftables};
+use super::{dns_proxy, nftables};
 
 const BASE_PORT: u16 = 5354;
+
+/// Whether this host can enforce web filtering at all. Reported to the server
+/// in `agent_hello.capabilities`, which hides the feature when false.
+pub fn is_available() -> bool {
+    nftables::is_available()
+}
 
 /// Owns the per-UID DNS proxy tasks and the nftables ruleset.
 ///

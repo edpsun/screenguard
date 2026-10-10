@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::db::{AgentMode, Db};
-use crate::dbus::{SessionEvent, SessionUsageState, uid_counts_usage};
 use crate::enforcement::{evaluate_enforcement, execute_lock, handle_midnight};
-use crate::users::{diff_users, scan_local_users, users_to_map};
-use crate::web_filter::WebFilter;
 use crate::ws_client::{self, ConnectionEvent};
+use platform::users::{diff_users, scan_local_users, users_to_map};
+use platform::web_filter::WebFilter;
+use platform::{SessionEvent, SessionUsageState, uid_counts_usage};
 
 type SessionStates = HashMap<u32, HashMap<String, SessionUsageState>>;
 
@@ -59,7 +59,7 @@ pub struct HeartbeatLoop {
     cache_ttl_hours: u64,
     notified_thresholds: HashMap<u32, HashSet<i32>>,
     locked_uids: Arc<tokio::sync::Mutex<HashSet<u32>>>,
-    status_handle: Option<Arc<crate::status_dbus::Handle>>,
+    status_handle: Option<Arc<platform::status_ipc::Handle>>,
     web_filter: WebFilter,
     /// Experimental cloud mode: present ⇒ sent on every `agent_hello` so the
     /// cloud server can resolve this agent's tenant on each reconnect.
@@ -78,7 +78,7 @@ impl HeartbeatLoop {
         user_scan_interval_secs: u64,
         min_uid: u32,
         cache_ttl_hours: u64,
-        status_handle: Option<Arc<crate::status_dbus::Handle>>,
+        status_handle: Option<Arc<platform::status_ipc::Handle>>,
         web_filter_available: bool,
         cloud_account: Option<String>,
     ) -> Self {
@@ -277,7 +277,7 @@ impl HeartbeatLoop {
                 let summary = n.summary.clone();
                 let body = n.body.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::dbus::send_desktop_notification(uid, &summary, &body).await {
+                    if let Err(e) = platform::send_desktop_notification(uid, &summary, &body).await {
                         tracing::warn!("Desktop notification failed for uid={uid}: {e}");
                     }
                 });
@@ -356,7 +356,7 @@ impl HeartbeatLoop {
                     if schedule_changed {
                         let lang2 = lang.clone();
                         tokio::spawn(async move {
-                            let _ = crate::dbus::send_desktop_notification(
+                            let _ = platform::send_desktop_notification(
                                 uid,
                                 crate::i18n::notif_schedule_title(&lang2),
                                 crate::i18n::notif_schedule_updated(&lang2),
@@ -386,7 +386,7 @@ impl HeartbeatLoop {
                             );
                             let title = crate::i18n::notif_schedule_title(&lang).to_string();
                             tokio::spawn(async move {
-                                let _ = crate::dbus::send_desktop_notification(
+                                let _ = platform::send_desktop_notification(
                                     uid, &title, &body,
                                 ).await;
                             });
@@ -397,7 +397,7 @@ impl HeartbeatLoop {
                             );
                             let title = crate::i18n::notif_schedule_title(&lang).to_string();
                             tokio::spawn(async move {
-                                let _ = crate::dbus::send_desktop_notification(
+                                let _ = platform::send_desktop_notification(
                                     uid, &title, &body,
                                 ).await;
                             });
@@ -484,7 +484,7 @@ impl HeartbeatLoop {
                                     .get_all_session_ids(uid)
                                     .unwrap_or_default();
                                 if !session_ids.is_empty() {
-                                    if let Err(e) = crate::dbus::lock_sessions(&session_ids).await {
+                                    if let Err(e) = platform::lock_sessions(&session_ids).await {
                                         tracing::warn!("Re-lock failed for uid={uid}: {e}");
                                     }
                                 }
@@ -500,7 +500,7 @@ impl HeartbeatLoop {
                                     .get_all_session_ids(uid)
                                     .unwrap_or_default();
                                 if !session_ids.is_empty() {
-                                    if let Err(e) = crate::dbus::unlock_sessions(&session_ids).await {
+                                    if let Err(e) = platform::unlock_sessions(&session_ids).await {
                                         tracing::warn!("Unlock failed for uid={uid}: {e}");
                                     } else {
                                         tracing::info!("Unlocked sessions for uid={uid} (time granted)");
@@ -547,7 +547,7 @@ impl HeartbeatLoop {
                             .get_all_session_ids(uid)
                             .unwrap_or_default();
                         if !session_ids.is_empty() {
-                            if let Err(e) = crate::dbus::lock_sessions(&session_ids).await {
+                            if let Err(e) = platform::lock_sessions(&session_ids).await {
                                 tracing::warn!("Re-lock for lock_now failed for uid={uid}: {e}");
                             }
                         }
@@ -570,7 +570,7 @@ impl HeartbeatLoop {
             }
             ServerMessage::PairingAccepted(_) => {}
             ServerMessage::FetchLogs => {
-                let lines = collect_recent_logs();
+                let lines = platform::host::recent_logs();
                 let msg = WssMessage::new(
                     common::messages::MSG_LOG_RESPONSE,
                     &common::messages::LogResponse { lines },
@@ -583,16 +583,8 @@ impl HeartbeatLoop {
                 tracing::warn!("║  Downloading latest release from GitHub and          ║");
                 tracing::warn!("║  installing as root via install.sh --update          ║");
                 tracing::warn!("╚══════════════════════════════════════════════════════╝");
-                match tokio::process::Command::new("systemd-run")
-                    .args([
-                        "--no-block",
-                        "--unit=screenguard-update",
-                        "/bin/bash", "-c",
-                        "curl -fsSL https://github.com/adambie/screenguard/releases/latest/download/install.sh | bash -s -- --update",
-                    ])
-                    .spawn()
-                {
-                    Ok(_) => tracing::warn!("Remote update script launched — agent will restart when complete"),
+                match platform::host::self_update() {
+                    Ok(()) => tracing::warn!("Remote update script launched — agent will restart when complete"),
                     Err(e) => tracing::error!("Failed to launch remote update script: {e}"),
                 }
             }
@@ -624,7 +616,7 @@ impl HeartbeatLoop {
             let title = crate::i18n::notif_warning_title(&language).to_string();
             let body = crate::i18n::notif_warning_body(&language, remaining);
             tokio::spawn(async move {
-                if let Err(e) = crate::dbus::send_desktop_notification(
+                if let Err(e) = platform::send_desktop_notification(
                     uid, &title, &body,
                 ).await {
                     tracing::warn!("Warn notification failed for uid={uid}: {e}");
@@ -731,7 +723,7 @@ impl HeartbeatLoop {
                                     .get_all_session_ids(uid)
                                     .unwrap_or_default();
                                 if !session_ids.is_empty() {
-                                    if let Err(e) = crate::dbus::lock_sessions(&session_ids).await {
+                                    if let Err(e) = platform::lock_sessions(&session_ids).await {
                                         tracing::warn!("Offline re-lock failed for uid={uid}: {e}");
                                     }
                                 }
@@ -749,7 +741,7 @@ impl HeartbeatLoop {
                                     .get_all_session_ids(uid)
                                     .unwrap_or_default();
                                 if !session_ids.is_empty() {
-                                    if let Err(e) = crate::dbus::unlock_sessions(&session_ids).await {
+                                    if let Err(e) = platform::unlock_sessions(&session_ids).await {
                                         tracing::warn!("Offline unlock failed for uid={uid}: {e}");
                                     }
                                 }
@@ -773,9 +765,9 @@ impl HeartbeatLoop {
             &self.outbound_tx,
             MSG_AGENT_HELLO,
             &AgentHello {
-                machine_id: read_machine_id(),
-                hostname: gethostname(),
-                timezone: local_timezone(),
+                machine_id: platform::host::machine_id(),
+                hostname: platform::host::hostname(),
+                timezone: platform::host::timezone(),
                 agent_version: self.agent_version.clone(),
                 last_config_version: config_version,
                 capabilities: {
@@ -875,85 +867,6 @@ fn enforce_str(action: EnforceAction) -> &'static str {
         EnforceAction::Allow => "allow",
         EnforceAction::Warn => "warn",
         EnforceAction::Lock => "lock",
-    }
-}
-
-fn gethostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn read_machine_id() -> String {
-    std::fs::read_to_string("/etc/machine-id")
-        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
-}
-
-/// Best-effort detection of the host's IANA timezone name (e.g. `Europe/Warsaw`).
-///
-/// The server evaluates schedule windows, the daily-limit weekday, and the
-/// usage-counter rollover in whatever zone the agent reports here, so a wrong
-/// answer silently shifts enforcement away from the user's wall clock.
-fn local_timezone() -> String {
-    // Debian/Ubuntu style: plain text file.
-    if let Ok(s) = std::fs::read_to_string("/etc/timezone") {
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            tracing::info!("Detected system timezone {s} (from /etc/timezone)");
-            return s;
-        }
-    }
-    // systemd/Fedora/RHEL/Arch style: /etc/localtime is a symlink into a
-    // zoneinfo tree. `timedatectl set-timezone` writes a *relative* link
-    // (`../usr/share/zoneinfo/Europe/Warsaw`), and the path may be
-    // `/usr/lib/zoneinfo/` on some distros, so match on the last `zoneinfo/`
-    // segment rather than a fixed absolute prefix. Also handles multi-segment
-    // zones such as `America/Argentina/Buenos_Aires`.
-    if let Ok(path) = std::fs::read_link("/etc/localtime") {
-        let s = path.to_string_lossy();
-        if let Some(idx) = s.rfind("zoneinfo/") {
-            let tz = s[idx + "zoneinfo/".len()..].trim_matches('/').to_string();
-            if !tz.is_empty() {
-                tracing::info!("Detected system timezone {tz} (from /etc/localtime)");
-                return tz;
-            }
-        }
-    }
-    // Older Fedora/RHEL ship /etc/localtime as a plain copy, not a symlink, so
-    // the read_link above fails outright — ask systemd directly.
-    if let Ok(out) = std::process::Command::new("timedatectl")
-        .args(["show", "-p", "Timezone", "--value"])
-        .output()
-    {
-        if out.status.success() {
-            let tz = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !tz.is_empty() && tz != "n/a" {
-                tracing::info!("Detected system timezone {tz} (from timedatectl)");
-                return tz;
-            }
-        }
-    }
-    tracing::warn!(
-        "Could not detect system timezone from /etc/timezone, /etc/localtime, or \
-         timedatectl — falling back to UTC. Schedule windows, the daily-limit \
-         weekday, and usage rollover will all be evaluated in UTC. \
-         Fix with: timedatectl set-timezone <your-timezone>"
-    );
-    "UTC".to_string()
-}
-
-fn collect_recent_logs() -> Vec<String> {
-    let output = std::process::Command::new("journalctl")
-        .args(["-u", "screenguard-agent", "-n", "50", "--no-pager", "--output=short-iso"])
-        .output();
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect(),
-        Err(e) => vec![format!("Failed to read journal: {e}")],
     }
 }
 

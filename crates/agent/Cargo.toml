@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
+# everything OS-specific (sessions, locking, notifications, users, web filter)
+platform = { path = "../platform" }
 
 # async runtime
 tokio = { version = "1", features = ["full"] }
@@ -20,15 +22,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 # sqlite
 rusqlite = { version = "0.32", features = ["bundled"] }
-
-# dbus
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-
-# systemd watchdog/notify
-libsystemd = "0.7"
-
-# mdns discovery
-mdns-sd = "0.11"
 
 # serialization
 serde = { version = "1", features = ["derive"] }
@@ -48,3 +41,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # random (pairing code)
 rand = "0.8"
+
+# mDNS server discovery. Linux only: the macOS agent is always pointed at its
+# server explicitly (--server-url or --cloud-account).
+[target.'cfg(target_os = "linux")'.dependencies]
+mdns-sd = "0.11"

@@ -153,7 +153,7 @@ pub async fn execute_lock(
 
     // Final warning before the screen locks.
     if should_warn_before_lock(grace_minutes) {
-        let _ = crate::dbus::send_desktop_notification(
+        let _ = platform::send_desktop_notification(
             uid,
             crate::i18n::notif_lock_title(&language),
             crate::i18n::notif_lock_body(&language),
@@ -162,7 +162,7 @@ pub async fn execute_lock(
     }
 
     tracing::info!("Locking sessions for uid={uid}: {:?}", session_ids);
-    crate::dbus::lock_sessions(&session_ids).await?;
+    platform::lock_sessions(&session_ids).await?;
 
     if lock_behavior(preserve_tasks) == LockBehavior::PreserveAndRelock {
         tracing::info!("Keeping sessions running while uid={uid} remains locked");
@@ -188,7 +188,7 @@ pub async fn execute_lock(
 
     if !still_active.is_empty() {
         tracing::warn!("Sessions still active after grace period for uid={uid}, terminating");
-        crate::dbus::terminate_sessions(&still_active).await?;
+        platform::terminate_sessions(&still_active).await?;
     }
 
     Ok(true)

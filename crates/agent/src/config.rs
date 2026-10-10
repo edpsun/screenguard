@@ -45,7 +45,12 @@ pub struct AgentConfig {
 fn default_heartbeat_interval() -> u64 { 10 }
 fn default_user_scan_interval() -> u64 { 300 }
 fn default_cache_ttl_hours() -> u64 { 48 }
+/// Accounts below this uid belong to the system. Linux distributions start
+/// human users at 1000; macOS starts them at 501.
+#[cfg(target_os = "linux")]
 fn default_min_uid() -> u32 { 1000 }
+#[cfg(target_os = "macos")]
+fn default_min_uid() -> u32 { 501 }
 
 impl Default for AgentConfig {
     fn default() -> Self {

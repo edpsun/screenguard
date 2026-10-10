@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ScreenGuard agent LaunchDaemon (macOS).
+
+  Carries no command-line flags, exactly like the systemd unit: the server to
+  talk to lives in /etc/screenguard/agent.toml, so `launchctl kickstart` never
+  loses it.
+
+  KeepAlive is what makes the agent tamper-resistant — a standard (non-admin)
+  user can neither unload a LaunchDaemon nor kill the process for longer than
+  it takes launchd to restart it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.screenguard.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/screenguard-agent</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Keeps launchd from throttling a long-running poller down to
+         background CPU priority. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- The agent has no journal to query, so `fetch_logs` tails this file.
+         Keep it in sync with LOG_PATH in crates/platform/src/host.rs. -->
+    <key>StandardOutPath</key>
+    <string>/var/log/screenguard-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/screenguard-agent.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>

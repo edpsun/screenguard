@@ -59,9 +59,57 @@ jobs:
           name: binaries-${{ matrix.target }}
           path: dist/
 
+  build-macos:
+    name: Build (macOS ${{ matrix.arch }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" crates/agent/Cargo.toml
+
+      # Only the agent: the server and web UI are deployed on Linux, and there
+      # is no macOS tray application.
+      - name: Build agent
+        run: cargo build --release -p agent --target ${{ matrix.target }}
+
+      # Native arch only: the runners are Apple silicon, so the x86_64 build is
+      # a cross-compile whose tests could not be executed here.
+      - name: Test
+        if: matrix.arch == 'arm64'
+        run: cargo test --release -p agent -p platform -p common --target ${{ matrix.target }}
+
+      - name: Stage binaries
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/agent dist/screenguard-agent-macos-${{ matrix.arch }}
+          chmod +x dist/screenguard-agent-macos-${{ matrix.arch }}
+          shasum -a 256 dist/screenguard-agent-macos-${{ matrix.arch }} \
+            | awk '{print $1}' > dist/screenguard-agent-macos-${{ matrix.arch }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/
+
   release:
     name: Publish release
-    needs: [build]
+    needs: [build, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,7 +126,9 @@ jobs:
           cp deploy/screenguard-webui.service  dist/
           cp deploy/screenguard-tray.desktop   dist/
           cp deploy/screenguard-dbus.conf      dist/
+          cp deploy/org.screenguard.agent.plist dist/
           cp install.sh dist/
+          cp install-macos.sh dist/
           tar -czf dist/screenguard-webui.tar.gz \
             --exclude='__pycache__' \
             --exclude='*.pyc' \

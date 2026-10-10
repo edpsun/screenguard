@@ -1,16 +1,10 @@
 mod config;
 mod db;
-mod dbus;
 mod discovery;
-mod dns_proxy;
 mod enforcement;
 mod heartbeat;
 mod i18n;
-mod nftables;
 mod pairing;
-mod status_dbus;
-mod users;
-mod web_filter;
 mod ws_client;
 
 use anyhow::{Context, Result, bail};
@@ -73,10 +67,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let _ = libsystemd::daemon::notify(
-        false,
-        &[libsystemd::daemon::NotifyState::Status("starting".into())],
-    );
+    platform::host::notify_status("starting");
 
     // rustls 0.23 with the `ring` provider does not auto-select a process-level
     // CryptoProvider; install it before any wss:// (cloud mode) connection.
@@ -85,21 +76,11 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // Handle --lock-cinnamon: lock the Cinnamon screensaver as the current session user and exit.
-    // The agent spawns itself under the target uid with the user session bus set in the environment.
-    if args.get(1).map(String::as_str) == Some("--lock-cinnamon") {
-        std::process::exit(crate::dbus::lock_cinnamon_as_current_user().await);
-    }
-
-    // Handle --notify <summary> <body>: send a desktop notification as the current user and exit.
-    // The agent spawns itself under the target uid, so at this point we are already that user.
-    if args.get(1).map(String::as_str) == Some("--notify") {
-        let summary = args.get(2).map(String::as_str).unwrap_or("");
-        let body = args.get(3).map(String::as_str).unwrap_or("");
-        if let Err(e) = crate::dbus::notify_as_current_user(summary, body).await {
-            tracing::warn!("Notification failed: {e}");
-        }
-        return Ok(());
+    // Some platforms drive per-user work (notifications, locking a particular
+    // desktop) by re-executing this binary under the target uid. If that is
+    // what this process is, do the one job and exit.
+    if let Some(code) = platform::run_helper_mode(&args).await {
+        std::process::exit(code);
     }
 
     // Handle --reset: clear pairing state and exit.
@@ -141,15 +122,19 @@ async fn main() -> Result<()> {
         Db::open(None).context("Failed to open agent database")?,
     ));
 
-    let nft_available = nftables::is_available();
+    let web_filter_available = platform::web_filter::is_available();
     {
         let db = db.lock().await;
-        db.save_capability("web_filter", nft_available)?;
-        if nft_available {
-            tracing::info!("nft available — web filtering capability enabled");
-        } else {
-            tracing::warn!("nft not found — web filtering disabled. Install nftables to enable it.");
-        }
+        db.save_capability("web_filter", web_filter_available)?;
+    }
+    if web_filter_available {
+        tracing::info!("Web filtering capability enabled");
+    } else {
+        tracing::warn!(
+            "Web filtering is unavailable on this host — the server hides the feature \
+             for this device. On Linux, install nftables to enable it; on macOS it is \
+             not implemented."
+        );
     }
 
     let mode = {
@@ -201,7 +186,12 @@ async fn main() -> Result<()> {
             url
         } else {
             tracing::info!("Agent is unpaired, starting discovery + pairing flow");
-            discovery::resolve_server_url(cfg.server_url.as_deref())
+            // An explicit --server-url wins over agent.toml; with neither, the
+            // platform decides whether discovery is possible at all.
+            let configured = arg_value(&args, "--server-url")
+                .map(str::to_string)
+                .or_else(|| cfg.server_url.clone());
+            discovery::resolve_server_url(configured.as_deref())
                 .await?
                 .context("Could not discover or connect to a management server")?
         };
@@ -236,13 +226,10 @@ async fn main() -> Result<()> {
 
     let status_handle = {
         let http_url = cfg.webui_url.clone().unwrap_or_else(|| wss_to_http(&server_url));
-        match status_dbus::start(http_url).await {
-            Ok(h) => {
-                tracing::info!("Tray D-Bus interface registered");
-                Some(Arc::new(h))
-            }
+        match platform::status_ipc::start(http_url).await {
+            Ok(h) => Some(Arc::new(h)),
             Err(e) => {
-                tracing::warn!("Tray D-Bus interface unavailable: {e}");
+                tracing::warn!("Local status interface unavailable: {e}");
                 None
             }
         }
@@ -251,28 +238,24 @@ async fn main() -> Result<()> {
     let ws = ws_client::spawn(server_url, auth_token);
 
     let (session_tx, session_rx) = mpsc::channel(64);
-    let dbus_monitor = dbus::DbusMonitor::new(session_tx)
+    let session_monitor = platform::SessionMonitor::new(session_tx)
         .await
-        .context("Failed to connect to D-Bus system bus")?;
+        .context("Failed to start the session monitor")?;
     tokio::spawn(async move {
-        if let Err(e) = dbus_monitor.run().await {
-            tracing::error!("D-Bus monitor error: {e}");
+        if let Err(e) = session_monitor.run().await {
+            tracing::error!("Session monitor error: {e}");
         }
     });
 
-    let _ = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready]);
+    platform::host::notify_ready();
     tracing::info!("Agent ready");
 
-    if let Some(watchdog_dur) = libsystemd::daemon::watchdog_enabled(false) {
-        let interval = watchdog_dur / 2;
+    if let Some(interval) = platform::host::watchdog_interval() {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                let _ = libsystemd::daemon::notify(
-                    false,
-                    &[libsystemd::daemon::NotifyState::Watchdog],
-                );
+                platform::host::notify_watchdog();
             }
         });
     }
@@ -288,21 +271,18 @@ async fn main() -> Result<()> {
         cfg.min_uid,
         cfg.cache_ttl_hours,
         status_handle,
-        nft_available,
+        web_filter_available,
         effective_account,
     );
 
-    // SIGTERM: notify systemd STOPPING=1 then exit.
+    // SIGTERM: tell the service supervisor we are going down, then exit.
     tokio::spawn(async {
         if let Ok(mut signal) = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
         ) {
             signal.recv().await;
             tracing::info!("SIGTERM received, shutting down");
-            let _ = libsystemd::daemon::notify(
-                false,
-                &[libsystemd::daemon::NotifyState::Stopping],
-            );
+            platform::host::notify_stopping();
             std::process::exit(0);
         }
     });
