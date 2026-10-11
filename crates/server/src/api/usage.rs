@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use chrono::{Datelike, Local};
+use chrono::Datelike;
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -26,7 +26,7 @@ pub async fn get_usage(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     db::get_profile(&state.db, id).await.map_err(internal)?.ok_or_else(not_found)?;
 
-    let today = Local::now().date_naive();
+    let today = remaining::today_for_profile(&state.db, id).await.map_err(internal)?;
     let to = q.to.unwrap_or_else(|| today.to_string());
     let from = q.from.unwrap_or_else(|| {
         (today - chrono::Duration::days(30)).to_string()
@@ -72,7 +72,8 @@ pub async fn get_status(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let profile = db::get_profile(&state.db, id).await.map_err(internal)?.ok_or_else(not_found)?;
 
-    let today = Local::now().date_naive();
+    // Agent's day boundary, not the server process's — see today_for_profile.
+    let today = remaining::today_for_profile(&state.db, id).await.map_err(internal)?;
     let today_str = today.to_string();
     let dow = today.weekday().num_days_from_monday() as u8;
     let used_secs = db::get_used_seconds_for_profile_today(&state.db, id, &today_str).await.map_err(internal)?;
@@ -130,14 +131,15 @@ pub async fn dashboard(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let profiles = db::list_profiles(&state.db).await.map_err(internal)?;
-    let today = Local::now().date_naive();
-    let today_str = today.to_string();
-    let dow = today.weekday().num_days_from_monday() as u8;
     let pending = db::pending_agent_count(&state.db).await.map_err(internal)?;
     let online = state.online.read().await;
 
     let mut out = Vec::new();
     for p in &profiles {
+        // Each profile rolls over on its own agent's midnight.
+        let today = remaining::today_for_profile(&state.db, p.id).await.map_err(internal)?;
+        let today_str = today.to_string();
+        let dow = today.weekday().num_days_from_monday() as u8;
         let used_secs = db::get_used_seconds_for_profile_today(&state.db, p.id, &today_str)
             .await.map_err(internal)?;
         let limits = db::get_daily_limits(&state.db, p.id).await.map_err(internal)?;

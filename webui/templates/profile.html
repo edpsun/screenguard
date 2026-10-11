@@ -141,8 +141,10 @@
                       class="btn btn-sm btn-outline-secondary"
                       style="border-radius:20px;padding:5px 16px;font-size:13px">&#8853; +15m</button>
             </div>
+            {# No target_date: the server resolves "today" in the profile's own
+               timezone when the form is submitted, so a page left open across
+               midnight still credits the right day. #}
             <form method="post" action="{{ url_for('add_adjustment', profile_id=profile.id) }}">
-              <input type="hidden" name="target_date" value="{{ today }}">
               <input type="hidden" name="minutes" id="adjMinutes" value="0">
               <input type="hidden" name="reason" value="">
               <button id="adjApply" class="btn btn-primary w-100"
@@ -169,7 +171,6 @@
                 </button>
               </form>
               <form method="post" action="{{ url_for('add_adjustment', profile_id=profile.id) }}">
-                <input type="hidden" name="target_date" value="{{ today }}">
                 <input type="hidden" name="minutes" value="{{ ((ts.adjustments_minutes or 0) * -1) | int }}">
                 <input type="hidden" name="reason" value="unlock">
                 <button type="submit"

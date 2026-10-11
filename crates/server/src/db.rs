@@ -868,6 +868,30 @@ pub async fn update_agent_user(
     Ok(())
 }
 
+/// Timezone that defines this profile's day boundary: the timezone reported by
+/// the agent that enforces it (the paired, most recently seen one when a profile
+/// spans several machines). `None` when the profile has no managed agent user yet.
+///
+/// Usage rows are written against the agent's local date, so every "today" the
+/// admin side computes — status, dashboard, adjustments — has to come from here
+/// rather than from the server process's own timezone, which is UTC in the
+/// Docker deployment and therefore rolls the day over at the wrong moment.
+pub async fn profile_timezone(pool: &DbPool, profile_id: Uuid) -> Result<Option<String>> {
+    let tz: Option<String> = sqlx::query_scalar(
+        "SELECT a.timezone
+         FROM agent_users au
+         JOIN agents a ON a.id = au.agent_id
+         WHERE au.profile_id = $1 AND au.status = 'managed'
+         ORDER BY CASE WHEN a.status = 'paired' THEN 0 ELSE 1 END,
+                  COALESCE(a.last_seen_at, 0) DESC
+         LIMIT 1",
+    )
+    .bind(profile_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(tz)
+}
+
 pub async fn get_agent_users_for_profile(
     pool: &DbPool,
     profile_id: Uuid,
@@ -1951,5 +1975,94 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    /// A profile enforced by one agent that reports `timezone`.
+    async fn profile_with_agent_in_tz(pool: &DbPool, name: &str, timezone: &str) -> (Uuid, Uuid) {
+        let profile = create_profile(pool, name).await.unwrap();
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents
+             (id, machine_id, display_name, hostname, timezone, status, agent_version, created_at, last_seen_at)
+             VALUES ($1, $2, 'host', 'host', $3, 'paired', 'test', 1, 1)",
+        )
+        .bind(agent_id.to_string())
+        .bind(agent_id.to_string())
+        .bind(timezone)
+        .execute(pool)
+        .await
+        .unwrap();
+        upsert_agent_users(
+            pool,
+            agent_id,
+            &[LocalUser {
+                local_uid: 1000,
+                username: "kid".to_string(),
+                display_name: "Kid".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        let agent_user_id = get_agent_user(pool, agent_id, 1000).await.unwrap().unwrap().id;
+        update_agent_user(pool, agent_user_id, Some(profile.id), Some("managed"))
+            .await
+            .unwrap();
+        (profile.id, agent_user_id)
+    }
+
+    // Two timezones that are never on the same calendar day (UTC+14 and UTC-11),
+    // so whatever timezone the test host — or the server process — happens to be
+    // in, at most one of them can match it.
+    const EAST_TZ: chrono_tz::Tz = chrono_tz::Pacific::Kiritimati;
+    const WEST_TZ: chrono_tz::Tz = chrono_tz::Pacific::Niue;
+
+    #[tokio::test]
+    async fn profile_today_comes_from_the_agent_timezone_not_the_server_process() {
+        let pool = test_pool().await;
+        let (east, _) = profile_with_agent_in_tz(&pool, "East", EAST_TZ.name()).await;
+        let (west, _) = profile_with_agent_in_tz(&pool, "West", WEST_TZ.name()).await;
+
+        let now = Utc::now();
+        assert_eq!(
+            crate::remaining::today_for_profile(&pool, east).await.unwrap(),
+            now.with_timezone(&EAST_TZ).date_naive(),
+        );
+        assert_eq!(
+            crate::remaining::today_for_profile(&pool, west).await.unwrap(),
+            now.with_timezone(&WEST_TZ).date_naive(),
+        );
+    }
+
+    // Regression test: usage is recorded against the agent's local date, so the
+    // admin side has to ask for that same date. It used to derive "today" from
+    // the server process's timezone — UTC in the Docker deployment — so once the
+    // two calendars diverged (any evening in the Americas) the status page read
+    // an empty day: 0 minutes used, and the whole daily limit still "remaining".
+    #[tokio::test]
+    async fn todays_used_minutes_are_not_lost_when_the_server_clock_is_on_another_day() {
+        let pool = test_pool().await;
+        let now = Utc::now();
+
+        for (name, tz) in [("East", EAST_TZ), ("West", WEST_TZ)] {
+            let (profile_id, agent_user_id) = profile_with_agent_in_tz(&pool, name, tz.name()).await;
+            let agent_today = now.with_timezone(&tz).date_naive().to_string();
+            add_usage_seconds(&pool, agent_user_id, &agent_today, 30 * 60).await.unwrap();
+
+            let today = crate::remaining::today_for_profile(&pool, profile_id).await.unwrap();
+            assert_eq!(
+                get_used_seconds_for_profile_today(&pool, profile_id, &today.to_string())
+                    .await
+                    .unwrap(),
+                30 * 60,
+                "{name}: the day the agent counted usage against must be the day the admin UI reads",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_timezone_is_none_until_an_agent_user_is_managed() {
+        let pool = test_pool().await;
+        let profile = create_profile(&pool, "No agent yet").await.unwrap();
+        assert_eq!(profile_timezone(&pool, profile.id).await.unwrap(), None);
     }
 }

@@ -65,6 +65,15 @@ app.jinja_env.globals['t'] = t
 app.jinja_env.globals['days'] = days
 app.jinja_env.globals['SUPPORTED_LANGS'] = SUPPORTED_LANGS
 
+
+def _parse_date(value):
+    """Parse a YYYY-MM-DD string from the API, or None if absent/malformed."""
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── template filters ───────────────────────────────────────────────────────────
 
 @app.template_filter('ts_date')
@@ -397,7 +406,10 @@ def profile_detail(profile_id):
     for u in data.get("agent_users", []):
         u["agent_hostname"] = agents_by_id.get(str(u.get("agent_id", "")), {}).get("hostname", "?")
 
-    today_date = date.today()
+    # "Today" is whatever day the profile's agent is currently in — the web UI's
+    # own clock is UTC in the Docker deployment and would roll the day over at
+    # the wrong moment, showing an empty day with 0 minutes used.
+    today_date = _parse_date(((status or {}).get("today") or {}).get("date")) or date.today()
     week_offset = int(request.args.get('week', 0))
     week_start = today_date - timedelta(days=today_date.weekday()) + timedelta(weeks=week_offset)
     week_end = week_start + timedelta(days=6)
@@ -450,8 +462,7 @@ def profile_detail(profile_id):
                            week_max=chart_max,
                            week_offset=week_offset,
                            week_start=week_start,
-                           week_end=week_end,
-                           today=str(today_date))
+                           week_end=week_end)
 
 
 @app.route("/profiles/<profile_id>/rename", methods=["POST"])
@@ -569,7 +580,9 @@ def update_limits(profile_id):
 @app.route("/profiles/<profile_id>/adjust", methods=["POST"])
 @require_login
 def add_adjustment(profile_id):
-    target = request.form.get("target_date") or str(date.today())
+    # No target_date means "the profile's today": the server resolves it in the
+    # agent's timezone, so a grant always lands on the day being enforced.
+    target = request.form.get("target_date") or None
     minutes = request.form.get("minutes", "0")
     reason = request.form.get("reason", "").strip() or None
     try:

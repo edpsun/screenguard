@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Local, NaiveDate, NaiveTime, TimeZone, Timelike};
+use chrono::{NaiveDate, NaiveTime, TimeZone, Timelike};
 use common::messages::ConfigPush;
 use common::models::{
     DailyLimit as ModelDailyLimit, EnforceAction, RemainingEntry, Schedule as ModelSchedule,
@@ -137,8 +137,30 @@ pub async fn calculate_remaining_for_agent(
     Ok(entries)
 }
 
+/// The current date in the timezone that governs a profile's day boundary.
+///
+/// Prefers the enforcing agent's timezone (what usage rows are keyed by), then
+/// the admin's configured timezone, and only falls back to UTC when the profile
+/// has neither. Never derived from the server process's own timezone: that is
+/// UTC in the Docker deployment, which made "today" disagree with the agent's
+/// day and zeroed out the used time the admin UI reported.
+pub async fn today_for_profile(pool: &DbPool, profile_id: Uuid) -> Result<NaiveDate> {
+    let tz = match db::profile_timezone(pool, profile_id).await? {
+        Some(tz) => tz,
+        None => db::get_admin_timezone(pool).await.unwrap_or_else(|_| "UTC".to_string()),
+    };
+    Ok(today_in_timezone(&tz))
+}
+
 pub async fn build_config_push(pool: &DbPool, agent_id: Uuid, config_version: i64) -> Result<ConfigPush> {
     let agent_users = db::list_agent_users(pool, agent_id).await?;
+    let agent_timezone = db::get_agent_by_id(pool, agent_id)
+        .await?
+        .map(|a| a.timezone)
+        .unwrap_or_else(|| "UTC".to_string());
+    // Same day boundary the agent itself uses, so the adjustment pushed as
+    // "today's" is the one the agent enforces against.
+    let today = today_in_timezone(&agent_timezone).to_string();
     let mut user_configs = Vec::new();
 
     for au in &agent_users {
@@ -169,7 +191,6 @@ pub async fn build_config_push(pool: &DbPool, agent_id: Uuid, config_version: i6
             .collect();
 
         let enforcement = db::get_enforcement_settings(pool, profile_id).await?;
-        let today = Local::now().date_naive().to_string();
         let today_adj = db::sum_adjustments_for_date(pool, profile_id, &today).await?;
         let adjustment_message =
             db::latest_adjustment_reason_for_date(pool, profile_id, &today).await?;

@@ -3,7 +3,6 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use chrono::Local;
 use common::messages::{MSG_CONFIG_PUSH, MSG_NOTIFY_USER, MSG_REMAINING_UPDATE, NotifyUser, RemainingUpdate};
 use common::protocol::WssMessage;
 use serde::Deserialize;
@@ -191,7 +190,9 @@ pub async fn list_adjustments(
 
 #[derive(Deserialize)]
 pub struct CreateAdjustmentBody {
-    pub target_date: String,
+    /// Omit to target the profile's current day — the only date a caller can
+    /// name correctly without knowing which timezone the profile rolls over in.
+    pub target_date: Option<String>,
     pub adjustment_minutes: i32,
     pub reason: Option<String>,
 }
@@ -203,8 +204,13 @@ pub async fn create_adjustment(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     db::get_profile(&state.db, id).await.map_err(internal)?.ok_or_else(not_found)?;
 
+    let target_date = match body.target_date.as_deref().map(str::trim) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => remaining::today_for_profile(&state.db, id).await.map_err(internal)?.to_string(),
+    };
+
     let adj_id = db::create_adjustment(
-        &state.db, id, &body.target_date, body.adjustment_minutes,
+        &state.db, id, &target_date, body.adjustment_minutes,
         body.reason.as_deref(), None,
     ).await.map_err(internal)?;
 
@@ -219,7 +225,7 @@ pub async fn lock_now(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     db::get_profile(&state.db, id).await.map_err(internal)?.ok_or_else(not_found)?;
 
-    let today = Local::now().date_naive().to_string();
+    let today = remaining::today_for_profile(&state.db, id).await.map_err(internal)?.to_string();
     let used_secs = db::get_used_seconds_for_profile_today(&state.db, id, &today).await.map_err(internal)?;
     let limits = db::get_daily_limits(&state.db, id).await.map_err(internal)?;
     let weekday = db::weekday_for_date(&today);
@@ -417,7 +423,6 @@ pub async fn bump_and_propagate(state: &AppState, profile_id: Uuid) -> anyhow::R
         let msg = WssMessage::new(MSG_CONFIG_PUSH, &push)?;
         state.send_to_agent_id(DEFAULT_TENANT, au.agent_id, msg).await;
 
-        let today = Local::now().date_naive().to_string();
         let managed: Vec<(u32, u32)> = db::list_agent_users(&state.db, au.agent_id)
             .await?
             .iter()
@@ -433,7 +438,6 @@ pub async fn bump_and_propagate(state: &AppState, profile_id: Uuid) -> anyhow::R
             let msg = WssMessage::new(MSG_REMAINING_UPDATE, &RemainingUpdate { users: entries })?;
             state.send_to_agent_id(DEFAULT_TENANT, au.agent_id, msg).await;
         }
-        let _ = today;
     }
 
     Ok(version)
