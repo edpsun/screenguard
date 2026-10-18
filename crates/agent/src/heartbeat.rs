@@ -250,9 +250,29 @@ impl HeartbeatLoop {
                 let db = self.db.lock().await;
                 let _ = db.upsert_session(uid, &session_id, state.idle != Some(false));
                 drop(db);
-                session_states.entry(uid).or_default().insert(session_id, state);
+                session_states.entry(uid).or_default().insert(session_id.clone(), state);
                 let is_counting = uid_is_counting(session_states, uid);
                 update_usage_timer(uid, was_counting, is_counting, active_since);
+
+                // A session coming back from the lock screen while the uid is
+                // still blocked: re-lock it now rather than on the next
+                // heartbeat. The heartbeat path re-locks too, but only once per
+                // interval (and online only via the server's RemainingUpdate
+                // reply), which hands back up to `heartbeat_interval` seconds of
+                // unrestricted desktop. This fires off the local session event,
+                // so the latency is the backend's event latency instead — and it
+                // works with the server unreachable.
+                if state.locked == Some(false)
+                    && state.active == Some(true)
+                    && self.locked_uids.lock().await.contains(&uid)
+                {
+                    tracing::info!(
+                        "Re-locking uid={uid} session={session_id}: unlocked while still blocked"
+                    );
+                    if let Err(e) = platform::lock_sessions(&[session_id]).await {
+                        tracing::warn!("Immediate re-lock failed for uid={uid}: {e}");
+                    }
+                }
             }
             SessionEvent::PrepareForSleep { suspend: true } => {
                 for val in active_since.values_mut() {
