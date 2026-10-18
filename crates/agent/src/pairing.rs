@@ -18,12 +18,6 @@ fn generate_pairing_code() -> String {
         .collect()
 }
 
-fn machine_id() -> Result<String> {
-    let id = std::fs::read_to_string("/etc/machine-id")
-        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))?;
-    Ok(id.trim().to_string())
-}
-
 pub struct PairingResult {
     pub agent_id: String,
     pub auth_token: String,
@@ -36,8 +30,13 @@ pub struct PairingResult {
 /// on the `pairing_request` so the cloud server can route the agent to the right
 /// tenant. `None` ⇒ the field is omitted from the wire entirely (self-hosted).
 pub async fn run_pairing(server_url: &str, cloud_account: Option<&str>) -> Result<PairingResult> {
-    let hostname = gethostname();
-    let mid = machine_id().unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    // Both must come from the platform backend, which is also what
+    // `agent_hello` sends. Deriving them here instead let the pairing identify
+    // the machine differently from every later connection: the server then
+    // rejects the hello with "Unknown agent" and drops the socket, so the agent
+    // pairs and can never connect.
+    let hostname = platform::host::hostname();
+    let mid = platform::host::machine_id();
     let code = generate_pairing_code();
 
     println!("\n=== PAIRING CODE: {code} ===");
@@ -86,10 +85,4 @@ pub async fn run_pairing(server_url: &str, cloud_account: Option<&str>) -> Resul
             _ => {}
         }
     }
-}
-
-fn gethostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
 }

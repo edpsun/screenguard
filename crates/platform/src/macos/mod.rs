@@ -41,6 +41,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// logind's `IdleHint` does on Linux, where it is not configurable either.
 const IDLE_THRESHOLD: Duration = Duration::from_secs(300);
 
+/// Lowest uid macOS gives a human account (the first one created is 501).
+/// Everything below is a service account and can never be a managed user.
+const MIN_HUMAN_UID: u32 = 500;
+
 const LAUNCHCTL: &str = "/bin/launchctl";
 const SUDO: &str = "/usr/bin/sudo";
 const OSASCRIPT: &str = "/usr/bin/osascript";
@@ -200,43 +204,17 @@ impl SessionMonitor {
                     .await;
             }
 
-            for (session_id, (uid, state)) in &current {
-                match known.get(session_id) {
-                    None => {
+            for event in diff_sessions(&known, &current) {
+                match &event {
+                    SessionEvent::SessionStarted { uid, session_id } => {
                         tracing::info!("Session started: uid={uid} session={session_id}");
-                        self.send(SessionEvent::SessionStarted {
-                            uid: *uid,
-                            session_id: session_id.clone(),
-                        })
-                        .await;
-                        self.send(SessionEvent::StateChanged {
-                            uid: *uid,
-                            session_id: session_id.clone(),
-                            state: *state,
-                        })
-                        .await;
                     }
-                    Some((_, previous)) if previous != state => {
-                        self.send(SessionEvent::StateChanged {
-                            uid: *uid,
-                            session_id: session_id.clone(),
-                            state: *state,
-                        })
-                        .await;
+                    SessionEvent::SessionEnded { uid, session_id } => {
+                        tracing::info!("Session ended: uid={uid} session={session_id}");
                     }
-                    Some(_) => {}
+                    _ => {}
                 }
-            }
-
-            for (session_id, (uid, _)) in &known {
-                if !current.contains_key(session_id) {
-                    tracing::info!("Session ended: uid={uid} session={session_id}");
-                    self.send(SessionEvent::SessionEnded {
-                        uid: *uid,
-                        session_id: session_id.clone(),
-                    })
-                    .await;
-                }
+                self.send(event).await;
             }
 
             known = current;
@@ -248,17 +226,86 @@ impl SessionMonitor {
     }
 }
 
+/// Turn two consecutive polls into session events.
+///
+/// Order matters: a `StateChanged` never precedes the `SessionStarted` that
+/// registers its session, because the agent drops state updates for sessions it
+/// has not been told about.
+fn diff_sessions(
+    known: &HashMap<String, (u32, SessionUsageState)>,
+    current: &HashMap<String, (u32, SessionUsageState)>,
+) -> Vec<SessionEvent> {
+    let mut events = Vec::new();
+
+    for (session_id, (uid, state)) in current {
+        let started = |events: &mut Vec<SessionEvent>| {
+            events.push(SessionEvent::SessionStarted {
+                uid: *uid,
+                session_id: session_id.clone(),
+            });
+            events.push(SessionEvent::StateChanged {
+                uid: *uid,
+                session_id: session_id.clone(),
+                state: *state,
+            });
+        };
+
+        match known.get(session_id) {
+            // Same console session id, different owner. macOS keeps the id
+            // across a logout and across a fast user switch, so this is a new
+            // session as far as usage accounting goes. Carrying the old uid
+            // forward instead would pin the session to a user who is no longer
+            // in it, and — because the agent ignores state updates for a
+            // (uid, session) pair it does not know — the new user would then
+            // accrue no usage and see no lock, for as long as the session
+            // lives.
+            Some((previous_uid, _)) if previous_uid != uid => {
+                events.push(SessionEvent::SessionEnded {
+                    uid: *previous_uid,
+                    session_id: session_id.clone(),
+                });
+                started(&mut events);
+            }
+            None => started(&mut events),
+            Some((_, previous_state)) if previous_state != state => {
+                events.push(SessionEvent::StateChanged {
+                    uid: *uid,
+                    session_id: session_id.clone(),
+                    state: *state,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (session_id, (uid, _)) in known {
+        if !current.contains_key(session_id) {
+            events.push(SessionEvent::SessionEnded {
+                uid: *uid,
+                session_id: session_id.clone(),
+            });
+        }
+    }
+
+    events
+}
+
 /// Translate raw registry rows into the agent's usage model.
 ///
 /// A session counts as active only once login has finished and it owns the
 /// display; `idle` is machine-wide, so a session parked in the background by
 /// fast user switching is reported idle regardless of the HID timer.
+///
+/// Service accounts are dropped: `_windowserver` (uid 88) owns the console
+/// session whenever it sits at the login window, and a session filed under it
+/// would be counted as somebody's screen time.
 fn session_states(
     sessions: &[ConsoleSession],
     idle: Option<Duration>,
 ) -> HashMap<String, (u32, SessionUsageState)> {
     sessions
         .iter()
+        .filter(|s| s.uid >= MIN_HUMAN_UID)
         .map(|s| {
             let state = SessionUsageState {
                 active: Some(s.on_console && s.login_done),
@@ -620,6 +667,73 @@ mod tests {
         let state = state_of(&states, 501);
         assert_eq!(state.idle, None);
         assert!(!crate::session::session_counts_usage(&state));
+    }
+
+    /// `_windowserver` (88) holds the console session at the login window. It
+    /// used to be reported as a session of its own, and because the session id
+    /// is reused when the real user logs in, the session then stayed filed
+    /// under uid 88 for as long as it lived — no usage, no lock.
+    #[test]
+    fn service_account_sessions_are_not_reported() {
+        let states = session_states(&[session(88, true, false, true)], Some(Duration::ZERO));
+        assert!(states.is_empty());
+    }
+
+    fn poll(sessions: &[ConsoleSession]) -> HashMap<String, (u32, SessionUsageState)> {
+        session_states(sessions, Some(Duration::ZERO))
+    }
+
+    #[test]
+    fn a_session_changing_hands_ends_for_the_old_uid_and_starts_for_the_new() {
+        let before = poll(&[session(501, true, false, true)]);
+        // Same session id (`session()` derives it from the uid, so override it),
+        // different owner — a fast user switch, or a login after the window
+        // server held the console.
+        let mut taken_over = session(502, true, false, true);
+        taken_over.session_id = before.keys().next().unwrap().clone();
+        let after = poll(&[taken_over]);
+
+        let events = diff_sessions(&before, &after);
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|e| match e {
+                SessionEvent::SessionEnded { uid, .. } => ("ended", *uid),
+                SessionEvent::SessionStarted { uid, .. } => ("started", *uid),
+                SessionEvent::StateChanged { uid, .. } => ("state", *uid),
+                _ => ("other", 0),
+            })
+            .collect();
+        assert_eq!(kinds, vec![("ended", 501), ("started", 502), ("state", 502)]);
+    }
+
+    #[test]
+    fn an_unchanged_session_emits_nothing() {
+        let before = poll(&[session(501, true, false, true)]);
+        let after = poll(&[session(501, true, false, true)]);
+        assert!(diff_sessions(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn locking_emits_a_state_change_for_the_same_session() {
+        let before = poll(&[session(501, true, false, true)]);
+        let after = poll(&[session(501, true, true, true)]);
+
+        match diff_sessions(&before, &after).as_slice() {
+            [SessionEvent::StateChanged { uid, state, .. }] => {
+                assert_eq!(*uid, 501);
+                assert_eq!(state.locked, Some(true));
+            }
+            other => panic!("expected one state change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_vanished_session_ends() {
+        let before = poll(&[session(501, true, false, true)]);
+        match diff_sessions(&before, &HashMap::new()).as_slice() {
+            [SessionEvent::SessionEnded { uid, .. }] => assert_eq!(*uid, 501),
+            other => panic!("expected one session end, got {other:?}"),
+        }
     }
 
     #[test]

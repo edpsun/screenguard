@@ -111,10 +111,18 @@ fn parse_console_sessions(root: &Value) -> Result<Vec<ConsoleSession>> {
                 .unwrap_or_default()
                 .to_string(),
             // Both flags are absent on some macOS versions when false.
-            on_console: dict.get("kCGSSessionOnConsoleKey").is_some_and(as_bool),
-            login_done: dict.get("kCGSSessionLoginDoneKey").is_some_and(as_bool),
+            on_console: flag(dict, &["kCGSSessionOnConsoleKey", "kCGSessionOnConsoleKey"]),
+            // Apple is not consistent about the CGS/CGSession prefix: on macOS
+            // 26 the login flag arrives as `kCGSessionLoginDoneKey` (one S)
+            // while the keys around it keep two. Accept either spelling —
+            // guessing wrong here reads as "still at the login window", which
+            // would stop usage ever accruing.
+            login_done: flag(dict, &["kCGSessionLoginDoneKey", "kCGSSessionLoginDoneKey"]),
             // Only ever present while the screen is actually locked.
-            screen_locked: dict.get("CGSSessionScreenIsLocked").is_some_and(as_bool),
+            screen_locked: flag(
+                dict,
+                &["CGSSessionScreenIsLocked", "CGSessionScreenIsLocked"],
+            ),
         });
     }
     Ok(sessions)
@@ -132,6 +140,13 @@ fn find_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
         Value::Array(items) => items.iter().find_map(|v| find_key(v, key)),
         _ => None,
     }
+}
+
+/// First of `keys` that the session dictionary carries, read as a boolean.
+/// Absent everywhere ⇒ false, which is how the window server expresses a false
+/// flag on some macOS versions.
+fn flag(dict: &plist::Dictionary, keys: &[&str]) -> bool {
+    keys.iter().filter_map(|k| dict.get(k)).any(as_bool)
 }
 
 /// Registry booleans come back as `<true/>` on current macOS but as `1`/`0` in
@@ -227,6 +242,15 @@ mod tests {
             "<key>kCGSSessionOnConsoleKey</key><integer>1</integer>",
         );
         assert!(parse(&xml)[0].on_console);
+    }
+
+    /// macOS 26 spells the login flag `kCGSessionLoginDoneKey` — one S, unlike
+    /// every key around it. Reading it as absent means "still at the login
+    /// window", so the session never counts as active and no usage accrues.
+    #[test]
+    fn accepts_the_single_s_login_done_spelling() {
+        let xml = ROOT_PLIST.replace("kCGSSessionLoginDoneKey", "kCGSessionLoginDoneKey");
+        assert!(parse(&xml)[0].login_done);
     }
 
     #[test]

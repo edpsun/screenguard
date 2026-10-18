@@ -43,7 +43,7 @@ managed.
 ### `--from` is currently not optional
 
 Without `--from`, the installer downloads the published release. The latest
-release (0.10.12) predates three macOS fixes that are in the working tree but
+release (0.10.12) predates four macOS fixes that are in the working tree but
 not yet released:
 
 - pairing derived the machine id and hostname itself instead of asking the
@@ -53,6 +53,10 @@ not yet released:
 - `IOConsoleUsers` on macOS 26 spells the login flag `kCGSessionLoginDoneKey`
   with one `S`. Read as absent, every session looks like it is still at the
   login window, so no usage ever accrued.
+- a console session whose owner changed — `_windowserver` (uid 88) holds it at
+  the login window, and the id is reused when the real user logs in — stayed
+  filed under the old uid for the life of the session. The agent then counted
+  no usage for the real user and ignored their lock and unlock, silently.
 - a session returning from the lock screen while its uid is still blocked is
   now re-locked off the local session event, instead of waiting up to one
   heartbeat interval.
@@ -165,10 +169,24 @@ Run `./target/release/agent --probe` and check `login_done=true` for the logged
 in uid; if it is false while someone is clearly logged in, the `IOConsoleUsers`
 key spelling on this macOS version is not one of the ones handled.
 
+**Usage frozen, and locking or unlocking gets no reaction.** The session is
+filed under the wrong uid, so every event about it is dropped. Check who owns
+it:
+
+```bash
+sqlite3 /var/lib/screenguard/agent.db \
+  'select * from active_sessions; select * from usage_log;'
+```
+
+A `local_uid` that is not the logged-in user — 88 is `_windowserver` — with a
+`last_heartbeat` that never moves is this fault. Restarting the daemon while
+the user is logged in clears it.
+
 **Lock does nothing.** The backend tries `CGSession -suspend`, then the screen
 saver, then display sleep, verifying each against the registry, and logs which
 one worked. `CGSession` lives at an undocumented path that a macOS release can
-move, so the log line is the thing to read.
+move — it is **already gone on macOS 26**, where `--probe` reports it absent and
+locking falls back to the screen saver. The log line says which mechanism won.
 
 **Daemon will not start.** `launchctl print system/org.screenguard.agent` and
 the tail of `/var/log/screenguard-agent.log`; the installer also fails loudly
